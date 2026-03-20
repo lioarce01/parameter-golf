@@ -1,0 +1,15 @@
+# timestamp | run_id | val_bpb | artifact_size | note
+# Lower val_bpb = better. Artifact must be <= 16.000MB. Constraint: trains in <=10min on 8xH100.
+# All our runs on 1xH100 SXM (RunPod), ITERATIONS=10500 unless noted, MAX_WALLCLOCK_SECONDS=0.
+
+# --- LEADERBOARD REFERENCE (2026-03-19) ---
+2026-03-18 | LEADERBOARD_baseline  | 1.224400 | ~16.000MB | OpenAI baseline: 9L 512d 1024v GQA tied-emb relu^2 Muon
+2026-03-19 | LEADERBOARD_rank1     | 1.174800 | ~14.700MB | notapplica: 10L + MuonWD=0.02 + FP16emb + spectral_init + sigmoid_resid + sliding_window(stride=64)
+2026-03-19 | LEADERBOARD_rank2     | 1.192500 | ~15.800MB | Matthew Li: sliding_window(stride=64) only
+2026-03-19 | LEADERBOARD_rank4     | 1.201400 | ~15.900MB | Spokane Way: seq4096 + lr=0.02 + mom=0.99 + warmdown=3000
+2026-03-19 | LEADERBOARD_rank7     | 1.219700 | ~15.800MB | Renier Velazco: FP16emb + lr=0.06 + warmdown=3600
+
+# --- OUR RUNS ---
+2026-03-20 | sota_baseline_confirm | 1.175227 | 15.820MB | SOTA port confirmed on 1xH100. Config: 10L + MuonWD=0.02 + FP16emb + spectral_init + sigmoid_resid + EVAL_STRIDE=64, seq1024, lr=0.04, mom=0.95, warmdown=2500. Matches notapplica leaderboard.
+2026-03-20 | seq4096_full_v1       | 1.173828 | 14.344MB | SOTA + seq4096 + matrix_lr=0.02 + scalar_lr=0.02 + mom=0.99 + warmdown=3000 + batch=393216. Delta: -0.0014 vs SOTA. Small gain, not sufficient alone.
+2026-03-20 | screen_valemb_mtp     | PENDING  | ?MB       | Screening 2000 steps: seq4096 baseline + value_emb(kv_dim=256) + MTP(weight=0.1). Tier2 combo test.
