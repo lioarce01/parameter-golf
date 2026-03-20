@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import zlib
+import zstandard as zstd_lib
 from pathlib import Path
 
 import numpy as np
@@ -67,7 +68,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -87,8 +88,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    val_emb_weight = float(os.environ.get("VAL_EMB_WEIGHT", 1.0))
-    mtp_weight = float(os.environ.get("MTP_WEIGHT", 0.1))
 
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
@@ -285,7 +284,8 @@ def eval_val(
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
-# Quantize to int8+zlib for the submission size limit, then dequantize for final evaluation.
+# Quantize to int6+zstd for the submission size limit, then dequantize for final evaluation.
+# Int6 uses 31 symmetric levels (±15) stored as int8; zstd-22 exploits the low entropy for ~25% better compression vs int8+zlib.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -331,14 +331,14 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / 15.0).clamp_min(1.0 / 15.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -15, 15).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / 15.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -15, 15).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -396,7 +396,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "int6_clean_per_row_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -692,8 +692,6 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         train_seq_len: int = 1024,
-        use_val_emb: bool = True,
-        mtp_weight: float = 0.1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -701,12 +699,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.mtp_weight = mtp_weight
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = model_dim // num_heads
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        kv_dim = num_kv_heads * (model_dim // num_heads)
-        self.val_emb = nn.Embedding(vocab_size, kv_dim) if use_val_emb else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -751,23 +744,15 @@ class GPT(nn.Module):
                 block.resid_mix.data[1] = (1 - phase) * torch.ones(block.resid_mix.shape[1])
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
-        bsz, seqlen = input_ids.shape
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        # Value embeddings: per-token additive offset to attention V
-        if self.val_emb is not None and not lora:
-            val_delta = self.val_emb(input_ids)  # [bsz, seqlen, kv_dim] — added before reshape in attn
-            v_delta_fn = lambda n: val_delta
-        else:
-            v_delta_fn = None
-
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
-            vd = lora.v_loras[i] if lora else v_delta_fn
+            vd = lora.v_loras[i] if lora else None
             x = self.blocks[i](x, x0, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -775,7 +760,7 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
-            vd = lora.v_loras[bi] if lora else v_delta_fn
+            vd = lora.v_loras[bi] if lora else None
             x = self.blocks[bi](x, x0, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -788,14 +773,7 @@ class GPT(nn.Module):
             bsz, sl, V = logits.shape
             return F.cross_entropy(
                 logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none").reshape(bsz, sl)
-        loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1))
-        # MTP: auxiliary loss predicting token t+2 from hidden state at t
-        if self.mtp_weight > 0:
-            mtp_logits = F.linear(x[:, :-1, :], self.tok_emb.weight)
-            mtp_logits = self.logit_softcap * torch.tanh(mtp_logits / self.logit_softcap)
-            mtp_loss = F.cross_entropy(mtp_logits.float().reshape(-1, mtp_logits.size(-1)), target_ids[:, 1:].reshape(-1))
-            loss = loss + self.mtp_weight * mtp_loss
-        return loss
+        return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1))
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Forward pass returning logits [batch, seq_len, vocab]. For sliding window eval."""
@@ -1191,8 +1169,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         train_seq_len=args.train_seq_len,
-        use_val_emb=args.val_emb_weight > 0,
-        mtp_weight=args.mtp_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1222,11 +1198,8 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_params = [base_model.tok_emb.weight]
-    if base_model.val_emb is not None:
-        tok_params.append(base_model.val_emb.weight)
     optimizer_tok = torch.optim.AdamW(
-        [{"params": tok_params, "lr": token_lr, "base_lr": token_lr}],
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         weight_decay=0.01,
@@ -1446,12 +1419,12 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = zstd_lib.ZstdCompressor(level=22).compress(quant_raw)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.int6.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
@@ -1462,9 +1435,9 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(zstd_lib.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=False)
 
     # Determine eval configuration
